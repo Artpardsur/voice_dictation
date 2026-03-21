@@ -1,0 +1,30 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+env/
+venv/
+.venv/
+.idea/
+.vscode/
+
+# Базы данных
+*.db
+*.sqlite
+*.sqlite3
+
+# Логи и временные файлы
+*.log
+*.tmp
+temp/
+output/
+input/
+
+# Секреты
+.env
+config.ini
+
+# Системные
+.DS_Store
+Thumbs.db
