@@ -1,19 +1,16 @@
 ﻿#!/usr/bin/env python
-\"\"\"
-Главный файл для запуска приложения
-\"\"\"
+"""
+Voice Dictation - Оффлайн голосовой ввод
+"""
 
 import sys
 import os
 
-# Добавляем путь к src для импортов
+# Добавляем путь к проекту
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-def main():
-    \"\"\"Основная функция\"\"\"
-    print("🚀 Запуск voice_dictation")
-    print("=" * 30)
-    print("Проект в разработке...")
+from ui.main_window import VoiceDictationApp
 
 if __name__ == "__main__":
-    main()
+    app = VoiceDictationApp()
+    app.run()
