@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 """
 Voice Dictation - Оффлайн голосовой ввод
 """

@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 *.so
@@ -6,25 +6,33 @@ __pycache__/
 env/
 venv/
 .venv/
-.idea/
-.vscode/
+.pytest_cache/
 
-# Базы данных
+# Модели Vosk — десятки мегабайт, скачиваются отдельно:
+#   python download_models.py
+models/
+*.zip
+
+# История надиктованного — личные записи
 *.db
 *.sqlite
 *.sqlite3
+history.db
 
-# Логи и временные файлы
+# Логи и временное
 *.log
 *.tmp
-temp/
-output/
-input/
+*.wav
 
 # Секреты
 .env
 config.ini
 
+# Редакторы
+.idea/
+.vscode/
+
 # Системные
 .DS_Store
 Thumbs.db
+desktop.ini

@@ -1,0 +1,13 @@
+[project]
+name = "voice-dictation"
+version = "1.1.0"
+description = "Оффлайн голосовой ввод: речь в текст без отправки звука куда-либо"
+requires-python = ">=3.9"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]

@@ -1,178 +1,213 @@
-﻿"""
-Оффлайн распознавание речи через Vosk
+"""Оффлайн распознавание речи через Vosk.
+
+Ничего никуда не отправляется: модель работает на этом же компьютере.
 """
 
-import json
-import queue
-import sys
-import sounddevice as sd
-import vosk
-import logging
-import os
+from __future__ import annotations
 
-logging.basicConfig(level=logging.INFO)
+import json
+import logging
+import queue
+import time
+from pathlib import Path
+from typing import Callable, Optional
+
+from . import models
+
 logger = logging.getLogger(__name__)
+
+SAMPLE_RATE = 16000
+BLOCK_SIZE = 8000
+# Дольше этого запись не тянется, даже если клавишу зажали и забыли.
+MAX_RECORD_SECONDS = 120
+
+
+class RecognizerError(RuntimeError):
+    """Не получилось подготовить распознавание."""
+
+
+def _rms(chunk: bytes) -> float:
+    """Громкость куска звука, 0..1 — для полоски уровня в интерфейсе.
+
+    Считается по самим отсчётам, а не выдумывается: прежняя версия рисовала
+    уровень случайными числами, и полоска дёргалась даже в тишине.
+    """
+    if not chunk:
+        return 0.0
+    import array
+
+    samples = array.array("h")
+    samples.frombytes(chunk[: len(chunk) - (len(chunk) % 2)])
+    if not samples:
+        return 0.0
+    total = sum(value * value for value in samples)
+    return min(1.0, ((total / len(samples)) ** 0.5) / 32768.0 * 4)
 
 
 class VoiceRecognizer:
-    """Распознавание речи оффлайн"""
-    
-    MODELS = {
-        "ru": "models/vosk-model-small-ru-0.22",
-        "en": "models/vosk-model-small-en-us-0.15"
-    }
-    
-    def __init__(self, language="ru", model_path=None):
-        """
-        Инициализация распознавателя
-        
-        Args:
-            language: язык ('ru' или 'en')
-            model_path: путь к папке с моделью Vosk
-        """
+    """Запись с микрофона и распознавание."""
+
+    def __init__(
+        self,
+        language: str = models.DEFAULT_LANGUAGE,
+        model_path: Optional[str] = None,
+        on_level: Optional[Callable[[float], None]] = None,
+    ) -> None:
         self.language = language
-        self.record_duration = 3  # секунд по умолчанию
-        
-        if model_path is None:
-            model_path = self.MODELS.get(language, self.MODELS["ru"])
-        
-        self.load_model(model_path)
-        
-        self.q = queue.Queue()
+        self.record_duration = 3          # секунд, если запись не push-to-talk
+        self.on_level = on_level
+
+        self.model = None
+        self.rec = None
+        self.stream = None
         self.is_recording = False
-        
-    def load_model(self, model_path):
-        """Загрузить модель Vosk"""
-        try:
-            if not os.path.exists(model_path):
-                logger.error(f"Модель не найдена: {model_path}")
-                logger.info("Создаю заглушку для тестирования интерфейса...")
-                # Заглушка для тестирования GUI
-                self.model = None
-                self.rec = None
-                return
-            
-            self.model = vosk.Model(model_path)
-            self.rec = vosk.KaldiRecognizer(self.model, 16000)
-            logger.info(f"Модель загружена: {model_path}")
-        except Exception as e:
-            logger.error(f"Ошибка загрузки модели: {e}")
-            logger.info("Работа в режиме заглушки (распознавание недоступно)")
-            self.model = None
-            self.rec = None
-    
-    def change_model(self, language):
-        """Сменить языковую модель"""
-        if language == self.language:
-            return
-        
-        self.language = language
-        model_path = self.MODELS.get(language, self.MODELS["ru"])
+        self.q: "queue.Queue[bytes]" = queue.Queue()
+
         self.load_model(model_path)
-        logger.info(f"Язык изменён на {language}")
-    
-    def callback(self, indata, frames, time, status):
-        """Callback для звукового потока"""
+
+    # --- модель --------------------------------------------------------------
+
+    @property
+    def ready(self) -> bool:
+        """Модель загружена и распознавание возможно."""
+        return self.rec is not None
+
+    def model_hint(self) -> str:
+        """Что сказать пользователю, если модели нет."""
+        info = models.get(self.language)
+        return (
+            f"Модель «{info.title}» не установлена ({info.size_mb} МБ).\n"
+            f"Скачать: python download_models.py {info.language}\n"
+            f"Или вручную: {info.url} — распаковать в папку models/"
+        )
+
+    def load_model(self, model_path: Optional[str] = None) -> bool:
+        """Загрузить модель Vosk. Возвращает True, если получилось."""
+        path = Path(model_path) if model_path else models.get(self.language).path
+
+        if not (path / "am" / "final.mdl").is_file():
+            logger.warning("Модель не найдена: %s", path)
+            self.model = self.rec = None
+            return False
+
+        try:
+            import vosk
+
+            vosk.SetLogLevel(-1)          # иначе Vosk засыпает консоль отладкой
+            self.model = vosk.Model(str(path))
+            self.rec = vosk.KaldiRecognizer(self.model, SAMPLE_RATE)
+            logger.info("Модель загружена: %s", path)
+            return True
+        except ImportError:
+            logger.error("Не установлен vosk: pip install -r requirements.txt")
+        except Exception as error:  # noqa: BLE001 — Vosk бросает разное
+            logger.error("Ошибка загрузки модели: %s", error)
+        self.model = self.rec = None
+        return False
+
+    def change_model(self, language: str) -> bool:
+        if language == self.language and self.ready:
+            return True
+        self.language = language
+        return self.load_model()
+
+    # --- запись ---------------------------------------------------------------
+
+    def _callback(self, indata, frames, time_info, status) -> None:
         if status:
-            logger.warning(f"Audio error: {status}")
-        self.q.put(bytes(indata))
-    
-    def start_recording(self):
-        """Начать запись с микрофона"""
-        self.is_recording = True
+            logger.warning("Звуковой поток: %s", status)
+        chunk = bytes(indata)
+        self.q.put(chunk)
+        if self.on_level:
+            self.on_level(_rms(chunk))
+
+    def start_recording(self) -> bool:
+        """Начать запись с микрофона."""
+        if self.is_recording:
+            return True
+
+        try:
+            import sounddevice as sd
+        except ImportError:
+            logger.error("Не установлен sounddevice: pip install -r requirements.txt")
+            return False
+
         self.q = queue.Queue()
-        
         try:
             self.stream = sd.RawInputStream(
-                samplerate=16000,
-                blocksize=8000,
+                samplerate=SAMPLE_RATE,
+                blocksize=BLOCK_SIZE,
                 device=None,
-                dtype='int16',
+                dtype="int16",
                 channels=1,
-                callback=self.callback
+                callback=self._callback,
             )
             self.stream.start()
-            logger.info("Запись начата")
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка при старте записи: {e}")
+        except Exception as error:  # noqa: BLE001 — sounddevice бросает своё
+            logger.error("Не удалось открыть микрофон: %s", error)
+            self.stream = None
             return False
-    
-    def stop_recording(self):
-        """Остановить запись"""
+
+        self.is_recording = True
+        logger.info("Запись начата")
+        return True
+
+    def stop_recording(self) -> None:
         self.is_recording = False
-        if hasattr(self, 'stream'):
-            self.stream.stop()
-            self.stream.close()
+        if self.stream is not None:
+            try:
+                self.stream.stop()
+                self.stream.close()
+            except Exception:  # noqa: BLE001 — закрытие не должно ронять программу
+                pass
+            self.stream = None
+        if self.on_level:
+            self.on_level(0.0)
         logger.info("Запись остановлена")
-    
-    def recognize(self):
-        """
-        Распознать записанный текст
-        
-        Returns:
-            str: распознанный текст или пустая строка
-        """
-        if not self.rec:
-            logger.warning("Модель не загружена, распознавание недоступно")
+
+    # --- распознавание ----------------------------------------------------------
+
+    def recognize(self) -> str:
+        """Разобрать накопленный звук и вернуть текст."""
+        if not self.ready:
+            logger.warning("Модель не загружена")
             return ""
-        
+
         self.rec.Reset()
-        result_text = ""
-        
-        # Обрабатываем все накопленные аудиоданные
-        audio_chunks = 0
+        pieces = []
+        chunks = 0
+
         while not self.q.empty():
             data = self.q.get()
-            audio_chunks += 1
+            chunks += 1
             if self.rec.AcceptWaveform(data):
                 result = json.loads(self.rec.Result())
-                if 'text' in result:
-                    result_text += " " + result['text']
-                    logger.info(f"Промежуточный результат: {result['text']}")
-        
-        # Финальный результат
+                if result.get("text"):
+                    pieces.append(result["text"])
+
         final = json.loads(self.rec.FinalResult())
-        if 'text' in final:
-            result_text += " " + final['text']
-            logger.info(f"Финальный результат: {final['text']}")
-        
-        logger.info(f"Обработано аудио-чанков: {audio_chunks}")
-        
-        if result_text.strip():
-            logger.info(f"✅ Распознано: {result_text.strip()}")
-        else:
-            logger.warning("❌ Ничего не распознано")
-        
-        return result_text.strip()
-    
-    def record_and_recognize(self):
-        """
-        Записать и распознать
-        
-        Returns:
-            str: распознанный текст
+        if final.get("text"):
+            pieces.append(final["text"])
+
+        text = " ".join(pieces).strip()
+        logger.info("Кусков звука: %s, распознано: %r", chunks, text)
+        return text
+
+    def record_and_recognize(self, duration: Optional[float] = None) -> str:
+        """Записать заданное время и распознать.
+
+        ``duration=None`` — писать, пока не позовут :meth:`stop_recording`
+        (режим «удерживай клавишу»).
         """
         if not self.start_recording():
             return ""
-        
-        # Записываем заданное количество секунд
-        import time
-        logger.info(f"Запись {self.record_duration} секунд...")
-        for i in range(self.record_duration):
-            if not self.is_recording:
-                break
-            time.sleep(1)
-            logger.debug(f"Запись... {i+1}/{self.record_duration} сек")
-        
+
+        limit = MAX_RECORD_SECONDS if duration is None else min(duration, MAX_RECORD_SECONDS)
+        started = time.monotonic()
+        while self.is_recording and time.monotonic() - started < limit:
+            time.sleep(0.05)
+
         self.stop_recording()
-        
-        # Добавляем задержку перед распознаванием
-        time.sleep(0.5)
-        
-        # Вызываем распознавание
-        logger.info("Начинаю распознавание...")
-        text = self.recognize()
-        logger.info(f"Результат распознавания: '{text}'")
-        
-        return text
+        # Последний блок приходит из звукового потока с задержкой.
+        time.sleep(0.3)
+        return self.recognize()

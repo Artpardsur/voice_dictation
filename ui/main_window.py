@@ -1,4 +1,4 @@
-﻿"""
+"""
 Главное окно приложения с CustomTkinter
 """
 
@@ -11,9 +11,11 @@ import sys
 # Добавляем путь к src
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.recognizer import VoiceRecognizer
-from src.hotkey import HotkeyListener
+from src import models, textproc
 from src.clipboard import ClipboardManager
+from src.database import Database
+from src.hotkey import HotkeyListener
+from src.recognizer import VoiceRecognizer
 
 
 class VoiceDictationApp:
@@ -29,9 +31,11 @@ class VoiceDictationApp:
         self.root.geometry("700x600")
         self.root.minsize(600, 500)
         
-        # Компоненты
-        self.recognizer = VoiceRecognizer()
+        # Компоненты. on_level получает настоящую громкость с микрофона —
+        # полоска уровня больше не рисуется случайными числами.
+        self.recognizer = VoiceRecognizer(on_level=self._level_from_microphone)
         self.clipboard = ClipboardManager()
+        self.history = Database()
         self.hotkey_listener = None
         
         # Настройки записи
@@ -44,7 +48,17 @@ class VoiceDictationApp:
         
         self.setup_ui()
         self.setup_hotkeys()
-        
+        self.check_model()
+
+    def check_model(self):
+        """Сказать сразу, если модели нет, а не молчать до первой записи."""
+        if self.recognizer.ready:
+            info = models.get(self.recognizer.language)
+            self.update_status(f"Готов к работе · модель «{info.title}»")
+            return
+        self.update_status("⚠️ Модель не установлена")
+        self.text_area.insert("end", self.recognizer.model_hint() + "\n")
+
     def setup_ui(self):
         """Создаёт современный интерфейс"""
         
@@ -227,8 +241,18 @@ class VoiceDictationApp:
             seconds = self.record_duration % 60
             self.duration_value.configure(text=f"{minutes} мин {seconds} сек")
     
+    def _level_from_microphone(self, level):
+        """Уровень приходит из звукового потока — рисовать можно только
+        в главном потоке, поэтому передаём через root.after."""
+        try:
+            self.root.after(0, self.update_audio_level, level * 100)
+        except RuntimeError:
+            pass                      # окно уже закрыто
+
     def update_audio_level(self, level):
-        """Обновить визуализацию звука"""
+        """Обновить визуализацию звука. level — от 0 до 100."""
+        if not self.level_canvas.winfo_exists():
+            return
         self.level_canvas.delete("all")
         width = self.level_canvas.winfo_width()
         height = self.level_canvas.winfo_height()
@@ -263,34 +287,29 @@ class VoiceDictationApp:
         self.root.update_idletasks()
     
     def start_recording_animation(self):
-        """Анимация во время записи"""
+        """Вид окна во время записи.
+
+        Полоску уровня рисует _level_from_microphone по данным звукового
+        потока. Раньше здесь крутился цикл со случайными числами, и полоска
+        дёргалась даже в полной тишине.
+        """
         if not self.is_recording:
             return
-        
-        # Меняем цвет кнопки
-        self.record_btn.configure(
-            fg_color="#f38ba8",
-            text="🔴 ЗАПИСЬ... ОСТАНОВИТЬ?"
-        )
-        self.update_status("Идёт запись...", is_recording=True)
-        
-        # Имитация уровня звука (в реальном проекте здесь был бы реальный уровень)
-        import random
-        for _ in range(self.record_duration * 10):
-            if not self.is_recording:
-                break
-            level = random.randint(10, 90)
-            self.update_audio_level(level)
-            time.sleep(0.1)
+        self.record_btn.configure(fg_color="#f38ba8", text="🔴 ЗАПИСЬ — нажмите, чтобы остановить")
+        self.update_status("Идёт запись…", is_recording=True)
     
     def setup_hotkeys(self):
         """Настройка глобальных горячих клавиш"""
         def on_start():
             if not self.is_recording:
                 self.root.after(0, self.manual_record)
-        
+
         def on_stop():
-            pass
+            # Отпустили клавиши — заканчиваем запись. Раньше здесь было
+            # пусто, и запись всегда длилась ровно заданное число секунд,
+            # сколько бы ни говорили.
+            if self.is_recording:
+                self.root.after(0, self.recognizer.stop_recording)
         
         self.hotkey_listener = HotkeyListener(
             on_record_start=on_start,
@@ -320,11 +339,7 @@ class VoiceDictationApp:
     
     def _record_and_recognize(self):
         """Записать и распознать"""
-        # Настраиваем длительность
-        self.recognizer.record_duration = self.record_duration
-        
-        # Запускаем распознавание
-        text = self.recognizer.record_and_recognize()
+        text = self.recognizer.record_and_recognize(self.record_duration)
         
         # Обновляем UI в основном потоке
         self.root.after(0, lambda: self._on_recognition_complete(text))
@@ -387,5 +402,4 @@ class VoiceDictationApp:
 
 
 if __name__ == "__main__":
-    app = VoiceDictationApp()
-    app.run()
+    VoiceDictationApp().run()
